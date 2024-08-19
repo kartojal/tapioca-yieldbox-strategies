@@ -3,6 +3,7 @@ pragma solidity 0.8.22;
 
 // External
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -32,10 +33,10 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     
-    IStargateV2Pool public pool;
+    IStargateV2Pool public immutable pool;
     IStargateV2Staking public farm;
-    IERC20 public inputToken; //erc20 of token.erc20()
-    IERC20 public lpToken;
+    IERC20 public immutable inputToken; //erc20 of token.erc20()
+    IERC20 public immutable lpToken;
     IZeroXSwapper public swapper;
 
     ITapiocaOracle public stgInputTokenOracle;
@@ -45,6 +46,10 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
     bytes public arbInputTokenOracleData;
 
     ICluster internal cluster;
+    
+    /// @dev StargateBase: The rate between local decimals and shared decimals.
+    uint256 public immutable stargateConvertRate;
+
     bool public depositPaused;
     bool public withdrawPaused;
 
@@ -68,7 +73,6 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
     event AmountWithdrawn(address indexed to, uint256 amount);
     event ClusterUpdated(ICluster indexed oldCluster, ICluster indexed newCluster);
     event SwapperUpdated(IZeroXSwapper indexed oldCluster, IZeroXSwapper indexed newCluster);
-    event PoolUpdated(address indexed oldAddy, address indexed newAddy);
     event FarmUpdated(address indexed oldAddy, address indexed newAddy);
     event Paused(bool prev, bool crt, bool isDepositType);
     event ArbOracleUpdated(address indexed oldAddy, address indexed newAddy);
@@ -115,6 +119,8 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
         arbInputTokenOracleData = _arbInputTokenOracleData;
 
         swapper = _swapper;
+
+        stargateConvertRate = 10 ** (IERC20Metadata(address(inputToken)).decimals() - pool.sharedDecimals());
 
         transferOwnership(_owner);
     }
@@ -173,7 +179,6 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
 
         //     - reset approvals
         inputToken.safeApprove(address(pearlmit), 0);
-        pearlmit.clearAllowance(address(this), 20, address(inputToken), 0);
     }
 
     /**
@@ -199,25 +204,25 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice updates the StargateV2 pool address.
-     * @dev can only be called by the owner.
-     * @param _pool the new address.
-     */
-    function setPool(address _pool) external onlyOwner {
-        if (address(_pool) == address(0)) revert EmptyAddress();
-        emit PoolUpdated(address(pool), _pool);
-        pool = IStargateV2Pool(_pool);
-    }
-
-    /**
      * @notice updates the StargateV2 staking address.
      * @dev can only be called by the owner.
      * @param _farm the new address.
      */
     function setFarm(address _farm) external onlyOwner {
         if (address(_farm) == address(0)) revert EmptyAddress();
+        // Withdraw and claim rewards from the previous farm
+        uint256 stakeAmount = farm.balanceOf(address(lpToken), address(this));
+        farm.withdraw(address(lpToken), stakeAmount);
+
         emit FarmUpdated(address(farm), _farm);
         farm = IStargateV2Staking(_farm);
+
+        // Deposit in new farm
+        uint256 lpBalance = lpToken.balanceOf(address(this));
+
+        lpToken.safeApprove(address(farm), lpBalance);
+        farm.deposit(address(lpToken), lpBalance);
+        lpToken.safeApprove(address(farm), 0);
     }
 
     /**
@@ -261,6 +266,7 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
         if(availableStg > 0) {
             // swap STG to usdc
             SSwapData memory swapData = abi.decode(stgData, (SSwapData));
+            if (address(swapData.data.buyToken) != address(inputToken)) revert TokenNotValid();
             _stg.safeApprove(address(swapper), availableStg);
             uint256 amountOut = swapper.swap(swapData.data, availableStg, swapData.minAmountOut);
             _stg.safeApprove(address(swapper), 0);
@@ -273,6 +279,7 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
         if (availableArb > 0) {
             // swap STG to usdc
             SSwapData memory swapData = abi.decode(arbData, (SSwapData));
+            if (address(swapData.data.buyToken) != address(inputToken)) revert TokenNotValid();
             _arb.safeApprove(address(swapper), availableArb);
             uint256 amountOut = swapper.swap(swapData.data, availableArb, swapData.minAmountOut);
             _arb.safeApprove(address(swapper), 0);
@@ -305,19 +312,27 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
     * @return amount The amount of STG that should be harvested
     */
     function pendingRewards() public view returns (uint256 amount) {
+        uint256 tokenIndex;
         address _rewarder = farm.rewarder(address(lpToken));
         (address[] memory tokens, uint256[] memory rewards) = IStargateV2MultiRewarder(_rewarder).getRewards(address(lpToken), address(this));
 
-        uint256 _index = _findIndex(tokens, STG);
-        uint256 stgRewardAmount = rewards[_index];
-        _index = _findIndex(tokens, ARB);
-        uint256 arbRewardAmount = rewards[_index];
-        if (stgRewardAmount == 0 && arbRewardAmount == 0) return 0;
+        tokenIndex = _findIndex(tokens, STG);
+        if (tokenIndex != 404 ) {
+            (bool stgOracleActive, uint256 stgPrice) = stgInputTokenOracle.peek(stgInputTokenOracleData);
+            if (stgOracleActive) {
+                amount += (rewards[tokenIndex] * stgPrice) / 1e18;
+            }
+        }
+        
+        tokenIndex = _findIndex(tokens, ARB);
+        if (tokenIndex != 404 ) {
+            (bool arbOracleActive, uint256 arbPrice) = arbInputTokenOracle.peek(arbInputTokenOracleData);
+            if (arbOracleActive) {
+                amount += ( rewards[tokenIndex] * arbPrice) / 1e18;
+            }
+        }
 
-        (, uint256 stgPrice) = stgInputTokenOracle.peek(stgInputTokenOracleData);
-        (, uint256 arbPrice) = arbInputTokenOracle.peek(arbInputTokenOracleData);
-        amount = (stgRewardAmount * stgPrice) / 1e18;
-        amount += (arbRewardAmount * arbPrice) / 1e18;
+        return amount;
     }
     
     /**
@@ -333,8 +348,8 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
     /* ============ INTERNAL ============ */
     // *********************************** //
     function _currentBalance() internal view override returns (uint256 amount) {
-        /// @dev: wrap fees are not taken into account here because it's 0
-        amount = farm.balanceOf(address(lpToken), address(this));
+        /// @dev: de-dust balance of LP token to follow StargatePool.redeem() logic if StargatePool convertRate is > 1
+        amount = _sd2ld(_ld2sd(farm.balanceOf(address(lpToken), address(this))));
         amount += IERC20(contractAddress).balanceOf(address(this));
         amount += pendingRewards();
     }
@@ -389,10 +404,32 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
         
         // retrieve total amount to withdraw, due received from Stargate can diff from `toWithdrawFromPool` if StargatePool convertRate is > 1
         uint256 withdrawalAmount = assetInContract + received;
+
         // send `contractAddress`
         IERC20(contractAddress).safeTransfer(to, withdrawalAmount);
         emit AmountWithdrawn(to, withdrawalAmount);
     }
+
+    /// @notice Translate an amount in SD to LD
+    /// @dev Since SD <= LD by definition, convertRate >= 1, so there is no rounding errors in this function.
+    /// @param _amountSD The amount in SD
+    /// @return amountLD The same value expressed in LD
+    function _sd2ld(uint64 _amountSD) internal view returns (uint256 amountLD) {
+        unchecked {
+            amountLD = _amountSD * stargateConvertRate;
+        }
+    }
+
+    /// @notice Translate an value in LD to SD
+    /// @dev Since SD <= LD by definition, convertRate >= 1, so there might be rounding during the cast.
+    /// @param _amountLD The value in LD
+    /// @return amountSD The same value expressed in SD
+    function _ld2sd(uint256 _amountLD) internal view returns (uint64 amountSD) {
+        unchecked {
+            amountSD = SafeCast.toUint64(_amountLD / stargateConvertRate);
+        }
+    }
+
 
     // ********************************* //
     /* ============ PRIVATE ============ */
@@ -404,7 +441,8 @@ contract StargateV2Strategy is BaseERC20Strategy, Ownable, ReentrancyGuard {
                 return i;
             }
         }
-        revert TokenNotValid();
+        // if index not found, return an arbitrary number 404, unexpected to have 404 different rewards in one staking contract
+        return 404;
     }
 
      function _depositAndStake(uint256 amount) private {

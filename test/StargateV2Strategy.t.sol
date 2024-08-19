@@ -7,7 +7,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-// Tapioca 
+// Tapioca
 import {IStargateV2MultiRewarder} from "tapioca-strategies/interfaces/stargatev2/IStargateV2MultiRewarder.sol";
 import {YieldBox, YieldBoxURIBuilder, IWrappedNative, TokenType, IStrategy} from "yieldbox/YieldBox.sol";
 import {IStargateV2Staking} from "tapioca-strategies/interfaces/stargatev2/IStargateV2Staking.sol";
@@ -23,14 +23,16 @@ import {ITOFT} from "tap-utils/interfaces/oft/ITOFT.sol";
 import {IYieldBox} from "yieldbox/interfaces/IYieldBox.sol";
 import {Cluster} from "tap-utils/Cluster/Cluster.sol";
 import {OracleMock} from "tapioca-strategies/mocks/OracleMock.sol";
-
+import {stdStorage, StdStorage} from "forge-std/Test.sol";              
+import {StargateMultiRewarder} from "./external/StargateMultiRewarder.sol";
 import {ZeroXSwapperMockTarget} from "tapioca-strategies/mocks/ZeroXSwapperMockTarget.sol";
 import {ToftMock} from "tapioca-strategies/mocks/ToftMock.sol";
 
 import "forge-std/Test.sol";
+import "forge-std/console.sol";
 
 
-contract StargateV2StrategyTest is Test { 
+contract StargateV2StrategyTest is Test {
     address owner;
     string constant ENV_BINANCE_WALLET_ADDRESS = "BINANCE_WALLET_ADDRESS";
     string constant ENV_POOL_ADDRESS = "STARGATEV2_POOL";
@@ -40,8 +42,6 @@ contract StargateV2StrategyTest is Test {
     string constant RPC_URL = "ARBITRUM_RPC_URL";
     string constant FORKING_BLOCK_NUMBER = "FORKING_ARBITRUM_BLOCK_NUMBER";
     uint256 ARB_FORK;
-
-
 
     address public binanceWalletAddr;
     address public weth;
@@ -60,12 +60,13 @@ contract StargateV2StrategyTest is Test {
     uint256 tUsdcAssetId;
 
     /**
-    * Modifiers
-    */
+     * Modifiers
+     */
     modifier isArbFork() {
         vm.selectFork(ARB_FORK);
         _;
     }
+
     function setUp() public {
         string memory rpcUrl = vm.envString(RPC_URL);
         uint256 forkingBlockNumber = vm.envUint(FORKING_BLOCK_NUMBER);
@@ -93,17 +94,17 @@ contract StargateV2StrategyTest is Test {
         swapper = new ZeroXSwapper(address(swapperTarget), ICluster(address(cluster)), address(this));
 
         strat = new StargateV2Strategy(
-        IYieldBox(address(yieldBox)),
-        ICluster(address(cluster)),
-        address(tUsdc),
-        address(pool),
-        address(farm),
-        ITapiocaOracle(address(stgOracleMock)),
-        "0x",
-        ITapiocaOracle(address(arbOracleMock)),
-        "0x",
-        IZeroXSwapper(address(swapper)),
-        address(this)
+            IYieldBox(address(yieldBox)),
+            ICluster(address(cluster)),
+            address(tUsdc),
+            address(pool),
+            address(farm),
+            ITapiocaOracle(address(stgOracleMock)),
+            "0x",
+            ITapiocaOracle(address(arbOracleMock)),
+            "0x",
+            IZeroXSwapper(address(swapper)),
+            address(this)
         );
         vm.label(address(strat), "StrategyV2Strategy");
 
@@ -138,7 +139,6 @@ contract StargateV2StrategyTest is Test {
         // make sure it was deposited
         uint256 farmBalance = farm.balanceOf(address(strat.lpToken()), address(strat));
         assertEq(farmBalance, amount);
-
 
         yieldBox.withdraw(tUsdcAssetId, address(this), address(this), amount, 0);
         uint256 tUsdcBalance = tUsdc.balanceOf(address(this));
@@ -193,13 +193,14 @@ contract StargateV2StrategyTest is Test {
         bool arbOrStgRewards = stgBalance > 0 || arbBalance > 0;
         assertTrue(arbOrStgRewards);
 
-
         //arb swap data
         IZeroXSwapper.SZeroXSwapData memory arbZeroXSwapData = IZeroXSwapper.SZeroXSwapData({
             sellToken: IERC20(arb),
             buyToken: IERC20(address(usdc)),
             swapTarget: payable(swapperTarget),
-            swapCallData: abi.encodeWithSelector(ZeroXSwapperMockTarget.transferTokens.selector, address(usdc), arbBalance/1e12)
+            swapCallData: abi.encodeWithSelector(
+                ZeroXSwapperMockTarget.transferTokens.selector, address(usdc), arbBalance / 1e12
+            )
         });
 
         vm.prank(binanceWalletAddr);
@@ -209,18 +210,16 @@ contract StargateV2StrategyTest is Test {
             sellToken: IERC20(stg),
             buyToken: IERC20(address(usdc)),
             swapTarget: payable(swapperTarget),
-            swapCallData: abi.encodeWithSelector(ZeroXSwapperMockTarget.transferTokens.selector, address(usdc), stgBalance/1e12)
+            swapCallData: abi.encodeWithSelector(
+                ZeroXSwapperMockTarget.transferTokens.selector, address(usdc), stgBalance / 1e12
+            )
         });
 
-        StargateV2Strategy.SSwapData memory stgSwapData = StargateV2Strategy.SSwapData({
-            minAmountOut: 0,
-            data: stgZeroXSwapData
-        });
+        StargateV2Strategy.SSwapData memory stgSwapData =
+            StargateV2Strategy.SSwapData({minAmountOut: 0, data: stgZeroXSwapData});
 
-        StargateV2Strategy.SSwapData memory arbSwapData = StargateV2Strategy.SSwapData({
-            minAmountOut: 0,
-            data: arbZeroXSwapData
-        });
+        StargateV2Strategy.SSwapData memory arbSwapData =
+            StargateV2Strategy.SSwapData({minAmountOut: 0, data: arbZeroXSwapData});
 
         uint256 farmBalanceBefore = farm.balanceOf(address(strat.lpToken()), address(strat));
 
@@ -229,6 +228,34 @@ contract StargateV2StrategyTest is Test {
 
         uint256 farmBalanceAfter = farm.balanceOf(address(strat.lpToken()), address(strat));
         assertGt(farmBalanceAfter, farmBalanceBefore);
+    }
+
+    function test_invest_stg_must_revert_if_wrong_token() public isArbFork {
+        //arb swap data
+        address arb = strat.ARB();
+        uint256 arbBalance = IERC20(arb).balanceOf(address(strat));
+
+        IZeroXSwapper.SZeroXSwapData memory arbZeroXSwapData = IZeroXSwapper.SZeroXSwapData({
+            sellToken: IERC20(usdc),
+            buyToken: IERC20(address(arb)), // replace USDC address with ARB address to ensure it fails due invalid output token
+            swapTarget: payable(swapperTarget),
+            swapCallData: abi.encodeWithSelector(ZeroXSwapperMockTarget.transferTokens.selector, address(usdc), arbBalance/1e12)
+        });
+
+        StargateV2Strategy.SSwapData memory arbSwapData = StargateV2Strategy.SSwapData({
+            minAmountOut: 0,
+            data: arbZeroXSwapData
+        });
+
+        StargateV2Strategy.SSwapData memory stgSwapData;
+
+        // Set ARB 1 wei balance to enter condition in strategy
+        deal(arb, address(strat), 1);
+
+        cluster.updateContract(0, address(strat), true);
+        
+        vm.expectRevert(StargateV2Strategy.TokenNotValid.selector);
+        strat.invest(abi.encode(arbSwapData), abi.encode(stgSwapData));
     }
 
     function test_emergencyWithdraw_stg() public isArbFork {
@@ -263,9 +290,6 @@ contract StargateV2StrategyTest is Test {
         assertEq(farmBalance, 0);
     }
 
-
-
-
     function _deposit(uint256 amount) private {
         vm.prank(binanceWalletAddr);
         IERC20(usdc).transfer(address(this), amount);
@@ -276,6 +300,64 @@ contract StargateV2StrategyTest is Test {
 
         IERC20(tUsdc).approve(address(yieldBox), type(uint256).max);
         yieldBox.depositAsset(tUsdcAssetId, address(this), address(this), amount, 0);
-
     }
+
+    function test_setFarm_e2e_withRewards() public isArbFork {
+        address newOwner = makeAddr("OWNER");
+        address newFarm = makeAddr('NEW_FARM');
+        /// Setup new StargateV2Staking and MultiRewarder ///
+
+        // Clone a StargateV2Staking instance via vm.etch and set owner
+        bytes memory farmBytecode = address(farm).code;
+        vm.etch(newFarm, farmBytecode);
+        vm.store(newFarm, bytes32(uint256(0)), bytes32(uint256(uint160(newOwner))));
+
+        // Deploy StargateMultiRewarder
+        address newRewarder = deployContract(abi.encodePacked(StargateMultiRewarder.creationCode(), abi.encode(newFarm)));
+        
+        IStargateV2Staking newFarmContract = IStargateV2Staking(newFarm);
+        IStargateV2MultiRewarder newRewarderContract = IStargateV2MultiRewarder(newRewarder);
+
+        assertEq(newRewarderContract.staking(), newFarm, "New rewarder immutable staking address is not correctly initialized");
+
+        // Stargate: Setup pool to new farm and rewarder
+        vm.startPrank(newOwner);
+        newFarmContract.setPool(pool.lpToken(), newRewarder);
+        vm.stopPrank();
+
+        assertTrue(newFarmContract.isPool(pool.lpToken()), "Cloned staking pool is not initialized");
+        assertEq(newFarmContract.rewarder(pool.lpToken()),  newRewarder, "Cloned staking pool rewarder is not initialized");
+
+        /// Simulate deposits and pending rewards ///
+        
+        uint256 amount = 10_000_000; // 10 USDC
+
+        deal(usdc, binanceWalletAddr, amount);
+        _deposit(amount);
+
+        vm.warp(1921684352);
+        
+        // Check pending stake before setFarm
+        assertEq(newFarmContract.balanceOf(pool.lpToken(), address(strat)), 0, "Current stake in new farm should be zero");
+        assertEq(farm.balanceOf(pool.lpToken(), address(strat)), amount, "Current stake in old farm should be deposited USDC LP amount");
+        
+
+        // Set new farm at strategy
+        strat.setFarm(newFarm);
+        assertEq(address(strat.farm()), newFarm);
+        
+        // Check pending stake post setFarm
+        assertEq(newFarmContract.balanceOf(pool.lpToken(), address(strat)), amount, "Current stake in new farm should be previous farm amount");
+        assertEq(farm.balanceOf(pool.lpToken(), address(strat)), 0, "Current stake in old farm should be zero");
+    }
+
+
+    function deployContract(bytes memory bytecode) internal returns (address instance) {
+      assembly{
+            instance := create(0, add(bytecode, 0x20), mload(bytecode))
+            if iszero(extcodesize(instance)) {
+                revert(0, 0)
+            }
+      }
+   }
 }
